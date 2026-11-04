@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import ValidationError as SchemaError
 
-from app.agent_models import Recommendation
+from app.agent_models import Recommendation, RecommendationResponse
 from app.agent_providers import SYSTEM_PROMPT, make_provider
 from app.agent_tools import ToolExecutor
 from app.database import DEFAULT_DATABASE, ValidationError
@@ -16,7 +16,7 @@ MAX_AGENT_RECORDS = 50
 
 
 def output_contract(record: dict) -> dict:
-    """The model may select safe workflow categories, but cannot invent factual prose."""
+    """Keep factual fields fixed while allowing a separately labeled interpretation."""
     codes = [item["code"] for item in record["validation_exceptions"]]
     refs = [f"row:{record['excel_row']}:finding:{index}" for index in range(1, len(record["findings"]) + 1)]
     explanations = []
@@ -34,14 +34,20 @@ def output_contract(record: dict) -> dict:
                    "Evidence is limited to this synthetic workbook and the current WMS records."]
     if not record["wms_evidence"]["existing_location"]:
         uncertainty.append("No exact authorized WMS record is available; no replacement value can be established.")
+    if conflicts:
+        simulated = "Deterministic mock simulation: review the existing-location and duplicate evidence together; do not select a row to overwrite or retain automatically."
+    else:
+        simulated = "Deterministic mock simulation: ask the customer to clarify the invalid value rather than choosing a permitted value on their behalf."
     template = dict(excel_row=record["excel_row"], customer_id=record["customer_id"],
         location_code=record["location_code"], exception_codes=codes, suggested_next_action=actions[0],
         explanation="\n".join(explanations), evidence_references=refs, uncertainty=uncertainty,
+        agent_rationale=dict(explanation=simulated,
+                             uncertainty=["Simulated rationale only; no LLM inference was performed."]),
         requires_human_approval=True, proposed_changes=[])
     return dict(allowed_actions=actions, approved_explanation=template["explanation"], template=template)
 
 
-def check_recommendation(output: dict, contract: dict, executor: ToolExecutor) -> dict:
+def check_recommendation(output: dict, contract: dict, executor: ToolExecutor, mode: str = "mock") -> dict:
     if not isinstance(output, dict) or output.get("requires_human_approval") is not True:
         raise ValidationError("INVALID_MODEL_OUTPUT", "Human approval must be explicitly required.", 502)
     try:
@@ -58,7 +64,17 @@ def check_recommendation(output: dict, contract: dict, executor: ToolExecutor) -
     if (recommendation["suggested_next_action"] not in contract["allowed_actions"] or len(refs) != len(set(refs))
             or not required <= set(refs) or not set(refs) <= required | executor.evidence.keys()):
         raise ValidationError("INVALID_MODEL_OUTPUT", "Recommendation references unsupported actions or evidence.", 502)
-    return recommendation
+    # Labels and verified facts are assembled only from backend-owned data.
+    # Free-form rationale is intentionally NOT classified as factual evidence.
+    recommendation["agent_rationale"].update(source="mock_simulation" if mode == "mock" else "openai_generated",
+                                             verified=False, requires_human_review=True)
+    record = executor.record
+    recommendation["verified_facts"] = deepcopy(dict(
+        validation_exceptions=record["validation_exceptions"],
+        wms_evidence=record["wms_evidence"], business_rules=record["business_rules"],
+        rules_customer_id=record["rules_customer_id"], comparison=record["comparison"],
+        findings=record["findings"], tool_results=executor.evidence))
+    return RecommendationResponse.model_validate(recommendation).model_dump()
 
 
 def analyze_report(report: dict, customer_id: str, database: Path = DEFAULT_DATABASE,
@@ -99,7 +115,7 @@ def analyze_report(report: dict, customer_id: str, database: Path = DEFAULT_DATA
             else:
                 if not executor.trace:
                     raise ValidationError("INVALID_MODEL_OUTPUT", "Agent must execute a read-only tool before recommending.", 502)
-                recommendations.append(check_recommendation(reply.output, contract, executor))
+                recommendations.append(check_recommendation(reply.output, contract, executor, mode))
                 trace.extend(executor.trace)
                 tool_evidence.update(executor.evidence)
                 break

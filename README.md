@@ -435,6 +435,10 @@ other ID is rejected. Location tools are disabled when the uploaded row's identi
 differs. Search is limited to five same-customer prefix candidates. Comparison
 accepts a code and customer ID only: both the upload record and WMS record are
 provided by the backend, preventing the model from inventing comparison inputs.
+`compare_record` additionally requires its `location_code` to equal the current
+uploaded row's code, then derives the lookup code from that trusted row. A mismatch
+returns HTTP 422 `COMPARISON_TARGET_MISMATCH` before querying. Exact lookups and
+similarity searches remain available for other same-customer codes as evidence.
 The model cannot supply database paths or raw SQL.
 
 There are at most **6 tool calls per record**, including calls in batches, and at
@@ -449,15 +453,38 @@ never appended to system instructions. Prompts alone are insufficient protection
 the backend also checks recommendation identity, exception codes, action category,
 evidence references, approval flag, and explanation against its evidence contract.
 
-For this MVP, the model must use backend-approved explanations derived from Step 3
-findings and preserve the stated uncertainties. It may select only permitted
-review categories and cite only that record's findings or executed tool results.
-Free-form factual explanations and **all proposed value changes are rejected**.
-This deliberately limits generative flexibility; the real model's main role is
-controlled tool planning and evidence selection, rather than unrestricted prose
-or autonomous correction. Missing/ambiguous values require customer clarification;
-existing-location and duplicate conflicts remain human review work. Numeric text
-and negative capacities are never silently converted.
+Recommendations separate two kinds of content:
+
+- **Verified evidence:** `verified_facts` is assembled by the backend from original
+  validation exceptions, WMS evidence, rules, findings (including duplicate Excel
+  row numbers), comparisons, and executed tool results. The model cannot supply or
+  replace this object. Top-level `explanation` remains the deterministic factual
+  explanation from Step 3, and top-level `uncertainty` preserves backend limitations.
+  Identity, exception codes, and factual fields must match the original contract.
+- **Unverified interpretation:** `agent_rationale.explanation` is concise generated
+  reasoning; `agent_rationale.uncertainty` lists missing information or uncertainty
+  in the model's own words. These may differ from the deterministic explanation.
+  The backend attaches `source: openai_generated` (or `mock_simulation`),
+  `verified: false`, and `requires_human_review: true`. The model cannot set these
+  provenance labels. Mock text explicitly identifies itself as a deterministic
+  simulation, not LLM reasoning.
+
+The provider schema (`Recommendation`) and assembled response schema
+(`RecommendationResponse`) keep those boundaries explicit. Rationale must contain
+nonblank, bounded strings (up to 1,500 characters each, one to five uncertainty
+items); malformed objects and attempts to label rationale as verified fail closed.
+Evidence references still must point to this row's findings or actually executed
+tool results. Next actions are limited to backend-permitted review categories.
+`requires_human_approval` must be exactly `true`, and `proposed_changes` must remain
+empty. All proposed value changes are rejected.
+
+These checks enforce provenance and authorization, **not the truth of free-form
+reasoning**. Rationale can be mistaken or hallucinate, including drawing an
+unsupported conclusion from a valid citation. Consumers must never present it as
+verified evidence, execute it, or treat its prose as approval. No keyword blacklist
+is used as the main safeguard. Missing/ambiguous values still require customer
+clarification; existing-location and duplicate conflicts remain human review work.
+Numeric text and negative capacities are never silently converted.
 
 ### API and CLI
 
@@ -513,6 +540,7 @@ Additional HTTP errors:
 | 502 | `PROVIDER_ERROR` | Provider request failed; raw remote details are suppressed |
 | 502 | `INVALID_MODEL_OUTPUT` | Malformed, unsupported, or ungrounded recommendation/response |
 | 422 | `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `TOOL_SCOPE_VIOLATION` | Unsafe tool request rejected |
+| 422 | `COMPARISON_TARGET_MISMATCH` | Comparison targets a code other than the current uploaded row |
 | 422 | `TOOL_LIMIT_EXCEEDED` | Per-record budget exhausted |
 | 413 | `AGENT_RECORD_LIMIT_EXCEEDED` | More than 50 invalid records |
 
@@ -522,7 +550,9 @@ analysis returns HTTP 200 even when the workbook has invalid records.
 
 ### Example structured recommendation
 
-Mock-mode recommendation for the synthetic invalid zone, Excel row 16:
+Mock-mode recommendation excerpt for the synthetic invalid zone, Excel row 16
+(`verified_facts` omitted here for brevity; the actual response includes the full
+backend evidence object):
 
 ```json
 {
@@ -532,6 +562,13 @@ Mock-mode recommendation for the synthetic invalid zone, Excel row 16:
   "exception_codes": ["INVALID_ZONE"],
   "suggested_next_action": "REQUEST_CUSTOMER_CLARIFICATION",
   "explanation": "The uploaded value is not in the requested customer's permitted values.",
+  "agent_rationale": {
+    "explanation": "Deterministic mock simulation: ask the customer to clarify the invalid value rather than choosing a permitted value on their behalf.",
+    "uncertainty": ["Simulated rationale only; no LLM inference was performed."],
+    "source": "mock_simulation",
+    "verified": false,
+    "requires_human_review": true
+  },
   "evidence_references": [
     "row:16:finding:1", "row:16:tool:1", "row:16:tool:2", "row:16:tool:3"
   ],
@@ -547,7 +584,10 @@ Mock-mode recommendation for the synthetic invalid zone, Excel row 16:
 
 ### Limits
 
-The synthetic workbook yields nine recommendations and 25 executed mock tool
+Generated rationale is intentionally unverified and must be reviewed even when
+its evidence references are valid. Real-provider integration tests use mocked
+network responses, not live LLM calls. The synthetic workbook yields nine
+recommendations and 25 executed mock tool
 calls. Only the few synthetic WMS records support these recommendations; prefix
 candidates never establish the correct replacement. Separate read-only queries
 are not an atomic database snapshot. There is no authentication or tenant identity

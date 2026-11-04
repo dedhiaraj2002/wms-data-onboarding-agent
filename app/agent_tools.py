@@ -20,7 +20,7 @@ DESCRIPTIONS = {
     "lookup_customer_rules": "Read the authorized customer's rules.",
     "lookup_location": "Read an exact authorized customer/location record.",
     "search_similar_locations": "Read at most five prefix candidates; none is an approved replacement.",
-    "compare_record": "Compare this uploaded row to a backend-retrieved WMS record. Neither record is supplied by the model.",
+    "compare_record": "Compare only the current uploaded row with its own exact WMS location. location_code must match the current row; neither record is supplied by the model.",
 }
 
 
@@ -61,6 +61,8 @@ class ToolExecutor:
         # An invalid row's customer is never used to widen authorization.
         if call.name != "lookup_customer_rules" and self.record["customer_id"] != self.customer_id:
             raise ValidationError("TOOL_SCOPE_VIOLATION", "Location tools are disabled for rows with mismatched customer identity.", 422)
+        if call.name == "compare_record" and args.location_code != self.record["location_code"]:
+            raise ValidationError("COMPARISON_TARGET_MISMATCH", "Comparison must use the current uploaded row's location code.", 422)
         if call.name == "lookup_customer_rules":
             result = lookup_customer_rules(self.customer_id, self.database)
         elif call.name == "lookup_location":
@@ -68,7 +70,7 @@ class ToolExecutor:
         elif call.name == "search_similar_locations":
             result = search_similar_locations(self.customer_id, args.location_code, self.database, args.limit)
         else:
-            existing = lookup_location(self.customer_id, args.location_code, self.database)
+            existing = lookup_location(self.customer_id, self.record["location_code"], self.database)
             result = compare_record(self.record["original_values"], existing) if existing else None
         reference = f"row:{self.record['excel_row']}:tool:{len(self.trace) + 1}"
         self.evidence[reference] = deepcopy(result)

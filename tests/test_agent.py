@@ -222,6 +222,8 @@ def test_real_adapter_native_tool_call_round_trip(reference, report):
         evidence = json.loads(body["messages"][-1]["content"])
         assert evidence["result"]["location_code"] == "LOC-001"
         output = context["output_contract"]["template"]
+        output["agent_rationale"] = dict(explanation="Review both the duplicate rows and the existing WMS match together before deciding next steps.",
+                                         uncertainty=["The workbook does not establish which duplicate should be retained."])
         output["evidence_references"].append(evidence["evidence_reference"])
         return httpx2.Response(200, json=completion({"content": json.dumps(output)}))
     small_report = deepcopy(report)
@@ -234,6 +236,11 @@ def test_real_adapter_native_tool_call_round_trip(reference, report):
     assert len(requests) == 2
     assert result["provider_mode"] == "openai"
     assert result["tool_execution_trace"][0]["tool_name"] == "lookup_location"
+    recommendation = result["recommendations"][0]
+    assert recommendation["agent_rationale"]["source"] == "openai_generated"
+    assert recommendation["agent_rationale"]["verified"] is False
+    assert recommendation["agent_rationale"]["explanation"].startswith("Review both")
+    assert recommendation["verified_facts"]["validation_exceptions"] == small_report["investigation"]["records"][0]["validation_exceptions"]
 
 
 @pytest.mark.parametrize("message,finish", [
@@ -351,3 +358,95 @@ def test_model_cannot_rewrite_backend_evidence_contract(reference, report):
         analyze_report(report, CUSTOMER, reference[1], provider=EvidenceMutatingProvider())
     assert error.value.code == "INVALID_MODEL_OUTPUT"
     assert report == before
+
+
+def test_comparison_cannot_target_another_location(reference, report, monkeypatch):
+    executor = ToolExecutor(CUSTOMER, report["investigation"]["records"][0], reference[1])
+    assert executor.record["location_code"] == "LOC-001"
+    with pytest.raises(ValidationError) as caught:
+        executor.execute(ToolCall("wrong", "compare_record", {"customer_id": CUSTOMER, "location_code": "LOC-100"}))
+    assert caught.value.code == "COMPARISON_TARGET_MISMATCH"
+    assert caught.value.status == 422
+    assert executor.trace == []
+    assert executor.evidence == {}
+    # Legitimate same-customer evidence gathering remains available.
+    found = executor.execute(ToolCall("lookup", "lookup_location", {"customer_id": CUSTOMER, "location_code": "LOC-100"}))
+    assert found["result"]["location_code"] == "LOC-100"
+    found = executor.execute(ToolCall("search", "search_similar_locations", {"customer_id": CUSTOMER, "location_code": "LOC-100", "limit": 3}))
+    assert found["result"]
+    assert all(item["location"]["customer_id"] == CUSTOMER for item in found["result"])
+
+
+@pytest.mark.parametrize("text", [
+    "Review whether this workbook intentionally repeats a location before choosing a resolution.",
+    "A human should reconcile the duplicate rows with the stored location; the upload alone does not establish intent.",
+])
+def test_distinct_model_rationale_preserves_verified_facts(reference, report, text):
+    def reinterpret(output):
+        output["agent_rationale"] = dict(explanation=text, uncertainty=["The customer's intended resolution is not known."])
+    before = deepcopy(report)
+    result = analyze_report(report, CUSTOMER, reference[1], mode="openai", provider=MutatingProvider(reinterpret))
+    recommendation = result["recommendations"][0]
+    original = before["investigation"]["records"][0]
+    assert recommendation["agent_rationale"] == dict(
+        explanation=text, uncertainty=["The customer's intended resolution is not known."],
+        source="openai_generated", verified=False, requires_human_review=True)
+    assert recommendation["explanation"] == output_contract(original)["approved_explanation"]
+    assert recommendation["uncertainty"] == output_contract(original)["template"]["uncertainty"]
+    facts = recommendation["verified_facts"]
+    for field in ("validation_exceptions", "wms_evidence", "business_rules", "findings", "comparison"):
+        assert facts[field] == original[field]
+    assert facts["tool_results"] == {ref: value for ref, value in result["tool_evidence"].items() if ref.startswith("row:2:")}
+    assert recommendation["requires_human_approval"] is True
+    assert recommendation["proposed_changes"] == []
+    assert report == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("verified_facts", {"business_rules": {"max_capacity_pallets": 999}}),
+    ("validation_exceptions", []), ("tool_results", {}),
+    ("business_rules", {"allowed_zones": ["FAKE"]}),
+])
+def test_model_cannot_supply_or_replace_verified_facts(reference, report, field, value):
+    with pytest.raises(ValidationError) as error:
+        analyze_report(report, CUSTOMER, reference[1], provider=MutatingProvider(lambda output: output.update({field: value})))
+    assert error.value.code == "INVALID_MODEL_OUTPUT"
+
+
+@pytest.mark.parametrize("rationale", [
+    None, "plain text instead of an object", {},
+    {"explanation": "", "uncertainty": ["Unknown"]},
+    {"explanation": "   ", "uncertainty": ["Unknown"]},
+    {"explanation": "Review", "uncertainty": []},
+    {"explanation": "Review", "uncertainty": [" "]},
+    {"explanation": "x" * 1501, "uncertainty": ["Unknown"]},
+    {"explanation": "Review", "uncertainty": ["Unknown"], "verified": True},
+    {"explanation": "Review", "uncertainty": ["Unknown"], "source": "verified_backend"},
+])
+def test_malformed_or_self_certified_rationale_rejected(reference, report, rationale):
+    with pytest.raises(ValidationError) as error:
+        analyze_report(report, CUSTOMER, reference[1], provider=MutatingProvider(lambda output: output.update(agent_rationale=rationale)))
+    assert error.value.code == "INVALID_MODEL_OUTPUT"
+
+
+def test_mock_rationale_is_explicitly_simulated(reference, report):
+    result = analyze_report(report, CUSTOMER, reference[1])
+    for row in result["recommendations"]:
+        rationale = row["agent_rationale"]
+        assert rationale["source"] == "mock_simulation"
+        assert rationale["verified"] is False
+        assert rationale["requires_human_review"] is True
+        assert rationale["explanation"].startswith("Deterministic mock simulation:")
+
+
+def test_provider_cannot_tamper_with_verified_context(reference, report):
+    class TamperingProvider(MockProvider):
+        def reply(self, messages, context):
+            context["record"]["business_rules"]["allowed_zones"] = ["FAKE"]
+            context["record"]["wms_evidence"]["existing_location"] = None
+            return super().reply(messages, context)
+    original = deepcopy(report)
+    result = analyze_report(report, CUSTOMER, reference[1], provider=TamperingProvider())
+    assert result["recommendations"][0]["verified_facts"]["business_rules"] == original["investigation"]["records"][0]["business_rules"]
+    assert result["recommendations"][0]["verified_facts"]["wms_evidence"] == original["investigation"]["records"][0]["wms_evidence"]
+    assert report == original
