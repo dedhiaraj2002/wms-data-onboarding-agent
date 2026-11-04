@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated synthetic database and workbook
+data/*.sqlite3
+data/*.xlsx
