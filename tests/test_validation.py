@@ -215,3 +215,122 @@ def test_expanded_archive_limit(reference):
     with pytest.raises(ValidationError) as caught:
         validate_workbook(stream.getvalue(), CUSTOMER, reference[1])
     assert caught.value.code == "WORKBOOK_TOO_LARGE"
+
+
+@pytest.mark.parametrize("field", ["customer_id", "location_code", "zone", "location_type", "capacity_pallets"])
+@pytest.mark.parametrize("error", ["#N/A", "#DIV/0!"])
+def test_excel_error_cells_rejected(reference, field, error):
+    content = workbook([valid(**{field: error})])
+    app.dependency_overrides[database_path] = lambda: reference[1]
+    try:
+        with TestClient(app) as client:
+            response = client.post("/validate", data={"customer_id": CUSTOMER}, files={"file": ("input.xlsx", content)})
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "UNSUPPORTED_CELL_VALUE"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_unsupported_duration_cell(reference):
+    from datetime import timedelta
+    with pytest.raises(ValidationError) as caught:
+        validate_workbook(workbook([valid(capacity_pallets=timedelta(days=1))]), CUSTOMER, reference[1])
+    assert caught.value.code == "UNSUPPORTED_CELL_VALUE"
+
+
+@pytest.mark.parametrize("value", [[], {}, object(), float("inf"), float("nan")])
+def test_cell_type_boundary(value):
+    from types import SimpleNamespace
+    from app.validation import cell_value
+    with pytest.raises(ValidationError) as caught:
+        cell_value(SimpleNamespace(value=value, data_type="n", coordinate="A2"))
+    assert caught.value.code == "UNSUPPORTED_CELL_VALUE"
+
+
+@pytest.mark.parametrize("rule,value", [
+    ("required_fields", None), ("required_fields", []), ("required_fields", [[]]),
+    ("required_fields", [" "]), ("required_fields", ["unsupported"]),
+    ("required_fields", ["zone", "zone"]),
+    ("allowed_zones", {}), ("allowed_zones", []), ("allowed_zones", [None]),
+    ("allowed_location_types", "PICK"), ("allowed_location_types", [""]),
+    ("location_code_pattern", []), ("location_code_pattern", {}),
+    ("location_code_pattern", None), ("location_code_pattern", 10),
+    ("location_code_pattern", ""), ("location_code_pattern", " "),
+    ("max_capacity_pallets", {}), ("max_capacity_pallets", True),
+    ("max_capacity_pallets", 0), ("max_capacity_pallets", float("inf")),
+    ("max_capacity_pallets", float("nan")),
+    ("capacity_must_be_positive_integer", False),
+    ("capacity_must_be_positive_integer", 1),
+    ("location_code_must_be_unique", "true"),
+])
+def test_rule_schema_errors_return_503(reference, rule, value):
+    with sqlite3.connect(reference[1]) as connection:
+        connection.execute("UPDATE customer_rules SET rule_value_json = ? WHERE rule_name = ?", (json.dumps(value), rule))
+    app.dependency_overrides[database_path] = lambda: reference[1]
+    try:
+        with TestClient(app) as client:
+            response = client.post("/validate", data={"customer_id": CUSTOMER}, files={"file": ("input.xlsx", workbook([valid()]))})
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "REFERENCE_DATA_ERROR"
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("change", ["missing", "unknown", "malformed_json"])
+def test_incomplete_or_unsupported_rules(reference, change):
+    with sqlite3.connect(reference[1]) as connection:
+        if change == "missing":
+            connection.execute("DELETE FROM customer_rules WHERE rule_name = ?", ("allowed_zones",))
+        elif change == "unknown":
+            connection.execute("INSERT INTO customer_rules VALUES (?, ?, ?)", (CUSTOMER, "unsupported_setting", "true"))
+        else:
+            connection.execute("UPDATE customer_rules SET rule_value_json = ? WHERE rule_name = ?", ("{broken", "allowed_zones"))
+    with pytest.raises(ValidationError) as caught:
+        validate_workbook(workbook([valid()]), CUSTOMER, reference[1])
+    assert caught.value.code == "REFERENCE_DATA_ERROR"
+
+
+def rewrite_archive(content, transform):
+    from zipfile import ZipFile, ZIP_DEFLATED
+    output = BytesIO()
+    with ZipFile(BytesIO(content)) as source:
+        entries = {name: source.read(name) for name in source.namelist()}
+    transform(entries)
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+        for name, value in entries.items():
+            archive.writestr(name, value)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("structure", ["vba", "macro_content_type", "macro_sheet", "external_link", "external_relationship", "embedded_object"])
+def test_unsafe_workbooks_rejected_before_loading(reference, monkeypatch, structure):
+    def transform(entries):
+        if structure == "vba":
+            entries["xl/vbaProject.bin"] = b"synthetic macro placeholder"
+        elif structure == "macro_content_type":
+            entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+                b"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                b"application/vnd.ms-excel.sheet.macroEnabled.main+xml")
+        elif structure == "macro_sheet":
+            entries["xl/macrosheets/sheet1.xml"] = b"<worksheet/>"
+        elif structure == "external_link":
+            entries["xl/externalLinks/externalLink1.xml"] = b"<externalLink/>"
+        elif structure == "external_relationship":
+            entries["xl/_rels/workbook.xml.rels"] = entries["xl/_rels/workbook.xml.rels"].replace(
+                b"</Relationships>", b'<Relationship Id="synthetic" Type="http://example.invalid/hyperlink" Target="https://example.invalid" TargetMode="External"/></Relationships>')
+        else:
+            entries["xl/embeddings/oleObject1.bin"] = b"synthetic embedded object"
+    content = rewrite_archive(workbook([valid()]), transform)
+
+    def must_not_load(*args, **kwargs):
+        pytest.fail("Unsafe archive reached openpyxl")
+
+    monkeypatch.setattr("app.validation.load_workbook", must_not_load)
+    app.dependency_overrides[database_path] = lambda: reference[1]
+    try:
+        with TestClient(app) as client:
+            response = client.post("/validate", data={"customer_id": CUSTOMER}, files={"file": ("input.xlsx", content)})
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "UNSAFE_WORKBOOK"
+    finally:
+        app.dependency_overrides.clear()

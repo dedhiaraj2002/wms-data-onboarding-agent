@@ -6,6 +6,7 @@ from pathlib import Path
 import math
 import re
 from zipfile import ZipFile
+from xml.etree import ElementTree
 
 from openpyxl import load_workbook
 import pandas as pd
@@ -19,6 +20,37 @@ MAX_COLUMNS = 100
 COLUMNS = ("customer_id", "location_code", "zone", "location_type", "capacity_pallets")
 
 
+def check_archive_policy(archive: ZipFile) -> None:
+    """Accept plain XLSX only: no macros, embedded binaries or external relationships."""
+    names = archive.namelist()
+    if len(set(names)) != len(names):
+        raise ValidationError("UNSAFE_WORKBOOK", "Duplicate archive entries are not supported.")
+    for name in names:
+        normalized = name.replace("\\", "/").lower()
+        if (normalized.endswith(".bin") or any(part in normalized.split("/") for part in
+                ("externallinks", "macrosheets", "dialogsheets", "activex", "embeddings"))):
+            raise ValidationError("UNSAFE_WORKBOOK", "Macros, embedded objects and external links are not permitted.")
+        if normalized == "[content_types].xml" or normalized.endswith(".rels"):
+            root = ElementTree.fromstring(archive.read(name))
+            for item in root.iter():
+                content_type = item.get("ContentType", "").lower()
+                relation_type = item.get("Type", "").lower()
+                if (any(marker in content_type or marker in relation_type for marker in
+                        ("macroenabled", "vba", "macrosheet", "dialogsheet", "externallink", "activex", "oleobject"))
+                        or item.get("TargetMode", "").lower() == "external"):
+                    raise ValidationError("UNSAFE_WORKBOOK", "Macros, embedded objects and external links are not permitted.")
+
+
+def cell_value(cell):
+    """Reject error/unsupported cells before pandas inference or JSON serialization."""
+    value = cell.value
+    if (cell.data_type == "e" or
+            (value is not None and not isinstance(value, (str, bool, int, float, date, datetime, time))) or
+            (isinstance(value, float) and not math.isfinite(value))):
+        raise ValidationError("UNSUPPORTED_CELL_VALUE", f"Unsupported cell value at {cell.coordinate}.")
+    return value.isoformat() if isinstance(value, (date, datetime, time)) else value
+
+
 def read_workbook(content: bytes) -> tuple[list[dict], list[str]]:
     if len(content) > MAX_UPLOAD_BYTES:
         raise ValidationError("UPLOAD_TOO_LARGE", "Workbook exceeds the 5 MiB upload limit.", 413)
@@ -26,6 +58,7 @@ def read_workbook(content: bytes) -> tuple[list[dict], list[str]]:
         with ZipFile(BytesIO(content)) as archive:
             if sum(item.file_size for item in archive.infolist()) > MAX_EXPANDED_BYTES:
                 raise ValidationError("WORKBOOK_TOO_LARGE", "Expanded workbook exceeds 25 MiB.", 413)
+            check_archive_policy(archive)
         workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
         try:
             if "locations" not in workbook.sheetnames:
@@ -33,8 +66,8 @@ def read_workbook(content: bytes) -> tuple[list[dict], list[str]]:
             sheet = workbook["locations"]
             if (sheet.max_row or 0) > MAX_ROWS + 1 or (sheet.max_column or 0) > MAX_COLUMNS:
                 raise ValidationError("WORKBOOK_TOO_LARGE", "Workbook exceeds 10,000 rows or 100 columns.", 413)
-            iterator = sheet.iter_rows(values_only=True)
-            headers = next(iterator, ())
+            iterator = sheet.iter_rows()
+            headers = tuple(cell_value(cell) for cell in next(iterator, ()))
             if any(not isinstance(h, str) for h in headers) or len(set(headers)) != len(headers):
                 raise ValidationError("INVALID_HEADERS", "Headers must be unique, nonempty text values.")
             # openpyxl preserves Excel booleans; pandas' inference can otherwise turn them into integers.
@@ -42,13 +75,9 @@ def read_workbook(content: bytes) -> tuple[list[dict], list[str]]:
             for index, values_row in enumerate(iterator):
                 if index >= MAX_ROWS or len(values_row) > MAX_COLUMNS:
                     raise ValidationError("WORKBOOK_TOO_LARGE", "Workbook exceeds 10,000 rows or 100 columns.", 413)
-                values.append(values_row)
+                values.append(tuple(cell_value(cell) for cell in values_row))
             frame = pd.DataFrame(values, columns=headers, dtype=object)
             records = frame.to_dict(orient="records")
-            for row in records:
-                for key, value in row.items():
-                    if isinstance(value, (date, datetime, time)):
-                        row[key] = value.isoformat()
             return records, list(headers)
         finally:
             workbook.close()
@@ -107,7 +136,7 @@ def validate_workbook(content: bytes, customer_id: str, database: Path = DEFAULT
         capacity = row["capacity_pallets"]
         if not missing(capacity):
             # Do not coerce numeric text, booleans or formulas into a capacity.
-            numeric = not isinstance(capacity, bool) and isinstance(capacity, (int, float)) and math.isfinite(capacity)
+            numeric = not isinstance(capacity, bool) and isinstance(capacity, (int, float)) and (isinstance(capacity, int) or math.isfinite(capacity))
             if not numeric or capacity <= 0 or int(capacity) != capacity:
                 add("INVALID_CAPACITY", "Capacity must be a positive integer Excel number.", "capacity_pallets")
             if numeric and capacity > rules["max_capacity_pallets"]:

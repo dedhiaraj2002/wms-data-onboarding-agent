@@ -186,3 +186,24 @@ both `LOC-001` rows have `DUPLICATE_LOCATION` and `LOCATION_EXISTS`; the other s
 intentional defects have their respective field errors. All errors on a record
 are collected. Tests cover the fixture, edge cases, dynamic rules, database
 read-only enforcement, API errors, CLI output, and Step 1 compatibility.
+
+### Workbook safety policy
+
+Only plain `.xlsx` workbooks are accepted. Archive metadata and relationships are
+inspected before openpyxl loads the workbook. Macro-enabled content, VBA/binary
+parts, macro/dialog sheets, ActiveX/embedded objects, external-link parts, and
+external relationships (including external hyperlinks) are rejected with HTTP
+400 `UNSAFE_WORKBOOK`. Duplicate ZIP entries are also rejected. Existing upload,
+expanded ZIP, row, and column limits still apply.
+
+Excel error cells (such as `#N/A`), duration cells, nonfinite numbers, and other
+unsupported cell values are rejected with HTTP 400 `UNSUPPORTED_CELL_VALUE`,
+including the cell coordinate. Supported scalar values remain unchanged; dates
+and times use ISO strings. Formulas remain unevaluated.
+
+Customer rule schemas must contain exactly the supported rule names. Required
+lists must be nonempty and contain unique, nonblank strings; required field names
+must be supported. Patterns must be nonempty valid regex strings, capacity limits
+must be positive finite numbers, and uniqueness must be boolean. Disabling the
+mandatory positive-integer capacity setting is unsupported. Invalid or incomplete
+configuration returns HTTP 503 `REFERENCE_DATA_ERROR`.

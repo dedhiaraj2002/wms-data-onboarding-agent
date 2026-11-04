@@ -32,20 +32,32 @@ def load_reference(path: Path, customer_id: str) -> tuple[dict, dict[str, set[st
                 "SELECT rule_name, rule_value_json FROM customer_rules WHERE customer_id = ?", (customer_id,))}
         required = {"required_fields", "allowed_zones", "allowed_location_types", "location_code_pattern",
                     "max_capacity_pallets", "location_code_must_be_unique", "capacity_must_be_positive_integer"}
-        if not required <= rules.keys():
-            raise ValueError("Incomplete customer rules")
+        if rules.keys() != required:
+            raise ValueError("Missing or unsupported customer rules")
+        fields = {"customer_id", "location_code", "zone", "location_type", "capacity_pallets"}
         for key in ("required_fields", "allowed_zones", "allowed_location_types"):
-            if not isinstance(rules[key], list) or not all(isinstance(v, str) for v in rules[key]):
-                raise ValueError("Expected string lists")
-        re.compile(rules["location_code_pattern"])
+            values = rules[key]
+            if (not isinstance(values, list) or not values
+                    or not all(isinstance(v, str) and v.strip() for v in values)
+                    or len(set(values)) != len(values)):
+                raise ValueError("Expected nonempty lists of unique, nonblank strings")
+        if not set(rules["required_fields"]) <= fields:
+            raise ValueError("Unsupported required fields")
+        pattern = rules["location_code_pattern"]
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError("Expected a nonempty regex string")
+        re.compile(pattern)
         limit = rules["max_capacity_pallets"]
-        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0:
+        if (isinstance(limit, bool) or not isinstance(limit, (int, float))
+                or (isinstance(limit, float) and not math.isfinite(limit)) or limit <= 0):
             raise ValueError("Invalid capacity limit")
-        for key in ("location_code_must_be_unique", "capacity_must_be_positive_integer"):
-            if not isinstance(rules[key], bool):
-                raise ValueError("Expected boolean rule")
+        if not isinstance(rules["location_code_must_be_unique"], bool):
+            raise ValueError("Expected boolean uniqueness rule")
+        # Positive integer capacity is mandatory in this version of the validator.
+        if rules["capacity_must_be_positive_integer"] is not True:
+            raise ValueError("Unsupported capacity setting")
         return rules, customers
-    except (sqlite3.Error, ValueError, TypeError, re.error) as exc:
+    except (sqlite3.Error, ValueError, TypeError, OverflowError, RecursionError, re.error) as exc:
         if isinstance(exc, ValidationError):
             raise
         raise ValidationError("REFERENCE_DATA_ERROR", "WMS database or customer rules are unavailable or invalid.", 503) from exc
