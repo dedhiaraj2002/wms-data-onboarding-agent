@@ -1,6 +1,6 @@
 # WMS Data Onboarding Agent
 
-Steps 1–3 provide a minimal API, reproducible synthetic warehouse fixtures, deterministic Excel validation, and read-only WMS investigation tools.
+Steps 1–4 provide a minimal API, synthetic warehouse fixtures, deterministic validation, read-only WMS investigation, and a bounded tool-calling agent.
 Use Python 3.12 (SQLite is included in Python). No credentials or external services are required.
 
 ## Setup and run
@@ -354,4 +354,207 @@ isolation, deterministic candidate limits, exact lookups and missing records,
 comparisons, every supported exception, duplicate row references, read-only
 behavior, API protections, and CLI JSON output/overwrite protection. Test-only
 extra tenants live in temporary databases; the existing synthetic fixtures are
-unchanged. Step 4 AI reasoning is not implemented.
+unchanged. The Step 4 layer is described below.
+
+## Step 4: bounded AI tool calling
+
+The deterministic validator still decides which rules fail. Step 3 still gathers
+read-only WMS evidence. The Step 4 agent examines **invalid records only**, requests
+allowlisted read-only tools, and produces evidence-grounded review recommendations.
+A recommendation is never authorization to approve, modify, or load data.
+
+Architecture:
+
+```text
+XLSX + requested customer
+  → existing validation and investigation
+  → agent orchestrator (app/agent.py), one invalid row at a time
+  → mock or OpenAI provider adapter (app/agent_providers.py)
+  → typed backend tool executor (app/agent_tools.py)
+  → strict Pydantic recommendation + deterministic evidence checks
+  → original reports + recommendations + tool traces and evidence
+```
+
+No LangChain/LangGraph is needed for this small, bounded loop. Provider adapters
+have no database handle or SQL execution capability. The backend binds the DB
+path and authorized customer; uploaded row identities cannot widen that scope.
+
+### Mock versus OpenAI
+
+`mock` is the default and needs no credentials. It deterministically requests
+customer rules and, when the row has the authorized identity and a usable code,
+an exact location lookup followed by comparison or prefix search. These calls
+really execute through the backend; results are not fabricated by generated text.
+**Mock mode is scripted and does not demonstrate real LLM reasoning.**
+
+`openai` uses the official Python SDK's native Chat Completions function calling
+and strict JSON-schema response format. The model selects tool calls; the backend
+validates and executes them and sends results back in tool messages. A final JSON
+response must pass the same output checks as mock mode. The default model is
+`gpt-4.1-mini`, configurable with `WMS_OPENAI_MODEL`; choose a model supporting
+both function calling and structured outputs.
+
+Install the updated pinned dependencies from the repository root:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+For OpenAI mode, supply `OPENAI_API_KEY` securely in the process environment, using
+your environment/secret manager or local session. Do not put it in source code,
+reports, shell history, or Git. The application does not load `.env` files.
+In a managed environment, the configured credential and permitted API destination
+must both be usable by the SDK. Mock mode needs no external network access.
+
+Linux/macOS, an interactive hidden prompt without a key literal in the command:
+
+```bash
+read -r -s -p "OpenAI API key: " OPENAI_API_KEY
+export OPENAI_API_KEY
+export WMS_OPENAI_MODEL=gpt-4.1-mini
+```
+
+Windows PowerShell:
+
+```powershell
+$credential = Read-Host "OpenAI API key" -AsSecureString
+$env:OPENAI_API_KEY = [System.Net.NetworkCredential]::new("", $credential).Password
+$env:WMS_OPENAI_MODEL = "gpt-4.1-mini"
+```
+
+Live OpenAI mode may incur provider charges. Automated tests never make paid API
+calls: SDK HTTP requests use in-memory mocked responses. A passing mocked adapter
+test does not establish live API authorization or model availability.
+
+### Tool registry and safety contract
+
+The only tool names are `lookup_customer_rules`, `lookup_location`,
+`search_similar_locations`, and `compare_record`. Their argument models forbid
+extra fields and coercion. Every call includes the authorized customer ID; any
+other ID is rejected. Location tools are disabled when the uploaded row's identity
+differs. Search is limited to five same-customer prefix candidates. Comparison
+accepts a code and customer ID only: both the upload record and WMS record are
+provided by the backend, preventing the model from inventing comparison inputs.
+The model cannot supply database paths or raw SQL.
+
+There are at most **6 tool calls per record**, including calls in batches, and at
+most **50 invalid records per request**. Unknown tools, malformed arguments,
+repeated call IDs, and exceeded limits fail closed. No final recommendation is
+accepted before at least one real tool call for that record. Provider calls use a
+30-second SDK timeout and no automatic retries; there is no global wall-clock
+budget across records. Workbook limits and safety checks remain unchanged.
+
+Excel values and database text are untrusted data, sent in data/tool messages,
+never appended to system instructions. Prompts alone are insufficient protection:
+the backend also checks recommendation identity, exception codes, action category,
+evidence references, approval flag, and explanation against its evidence contract.
+
+For this MVP, the model must use backend-approved explanations derived from Step 3
+findings and preserve the stated uncertainties. It may select only permitted
+review categories and cite only that record's findings or executed tool results.
+Free-form factual explanations and **all proposed value changes are rejected**.
+This deliberately limits generative flexibility; the real model's main role is
+controlled tool planning and evidence selection, rather than unrestricted prose
+or autonomous correction. Missing/ambiguous values require customer clarification;
+existing-location and duplicate conflicts remain human review work. Numeric text
+and negative capacities are never silently converted.
+
+### API and CLI
+
+Start the API as before, then use:
+
+```bash
+curl -X POST http://127.0.0.1:8000/agent/analyze \
+  -F 'customer_id=SYNTHETIC_CUSTOMER' \
+  -F 'mode=mock' \
+  -F 'file=@data/warehouse_locations.xlsx'
+```
+
+`mode` is an explicit multipart field: `mock` (default) or `openai`. Change it to
+`openai` only when the process has credentials and you want a real provider call.
+
+CLI, with the virtual environment active:
+
+```bash
+python -m scripts.run_agent data/warehouse_locations.xlsx \
+  --customer-id SYNTHETIC_CUSTOMER \
+  --database data/synthetic_wms.sqlite3 \
+  --mode mock --report /tmp/wms-agent-report.json
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+# Another terminal, same repository root:
+curl.exe -X POST http://127.0.0.1:8000/agent/analyze -F "customer_id=SYNTHETIC_CUSTOMER" -F "mode=mock" -F "file=@data/warehouse_locations.xlsx"
+# Or without the server:
+.\.venv\Scripts\python.exe -m scripts.run_agent data/warehouse_locations.xlsx --customer-id SYNTHETIC_CUSTOMER --mode mock --report "$env:TEMP\wms-agent-report.json"
+```
+
+The CLI refuses to overwrite an existing JSON output file. Exit codes remain 0
+for no invalid records, 1 for completed analysis with invalid records, and 2 for
+input/configuration/provider/output errors.
+
+Responses retain `validation` and `investigation` unchanged and add
+`provider_mode`, `recommendations`, `tool_execution_trace`, and `tool_evidence`.
+Trace entries contain Excel row number, tool name, sanitized schema-validated
+arguments, result status, and an evidence reference. Tool evidence contains actual
+backend results. `row:N:finding:I` references the one-based finding in Step 3 for
+Excel row N; `row:N:tool:I` references `tool_evidence` and the execution trace.
+Failure aborts the request with an error; no partial success report is returned.
+
+Additional HTTP errors:
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| 503 | `MISSING_API_CREDENTIALS` | OpenAI mode lacks `OPENAI_API_KEY` |
+| 502 | `PROVIDER_ERROR` | Provider request failed; raw remote details are suppressed |
+| 502 | `INVALID_MODEL_OUTPUT` | Malformed, unsupported, or ungrounded recommendation/response |
+| 422 | `UNKNOWN_TOOL`, `INVALID_TOOL_ARGUMENTS`, `TOOL_SCOPE_VIOLATION` | Unsafe tool request rejected |
+| 422 | `TOOL_LIMIT_EXCEEDED` | Per-record budget exhausted |
+| 413 | `AGENT_RECORD_LIMIT_EXCEEDED` | More than 50 invalid records |
+
+An unsupported API mode is rejected by FastAPI with HTTP 422. Existing workbook,
+customer and reference-data errors keep their earlier response codes. Completed
+analysis returns HTTP 200 even when the workbook has invalid records.
+
+### Example structured recommendation
+
+Mock-mode recommendation for the synthetic invalid zone, Excel row 16:
+
+```json
+{
+  "excel_row": 16,
+  "customer_id": "SYNTHETIC_CUSTOMER",
+  "location_code": "LOC-015",
+  "exception_codes": ["INVALID_ZONE"],
+  "suggested_next_action": "REQUEST_CUSTOMER_CLARIFICATION",
+  "explanation": "The uploaded value is not in the requested customer's permitted values.",
+  "evidence_references": [
+    "row:16:finding:1", "row:16:tool:1", "row:16:tool:2", "row:16:tool:3"
+  ],
+  "uncertainty": [
+    "No change is approved or applied. Human review is required.",
+    "Evidence is limited to this synthetic workbook and the current WMS records.",
+    "No exact authorized WMS record is available; no replacement value can be established."
+  ],
+  "requires_human_approval": true,
+  "proposed_changes": []
+}
+```
+
+### Limits
+
+The synthetic workbook yields nine recommendations and 25 executed mock tool
+calls. Only the few synthetic WMS records support these recommendations; prefix
+candidates never establish the correct replacement. Separate read-only queries
+are not an atomic database snapshot. There is no authentication or tenant identity
+system yet: the request customer ID is a demonstration scope, not production
+access control. Real provider mode sends the authorized record and evidence to
+OpenAI; use only synthetic data here. Prompt injection can still induce a provider
+failure or rejected output, even though it cannot widen the tool allowlist,
+customer scope, or output contract. There is no durable audit store or approval
+workflow. No model recommendation authorizes a data load, and Steps 5–7 are not
+implemented.
